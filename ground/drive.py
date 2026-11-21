@@ -21,6 +21,7 @@ import socket
 import struct
 import sys
 import time
+from collections import deque
 
 VID, PID = 0x2CA3, 0x1020
 REPORT_LEN = 13
@@ -279,6 +280,7 @@ def main():
     tel = None
     tel_t = 0.0
     last_print = 0.0
+    rx_times = deque(maxlen=400)   # 最近收到的遥测时刻，用来算上行收包率
     interval = 1.0 / SEND_HZ
 
     try:
@@ -325,21 +327,27 @@ def main():
 
             for t in link.poll():
                 tel, tel_t = t, now
+                rx_times.append(now)
 
             if now - last_print > 0.4:
                 last_print = now
+                # 上行收包率：遥测标称 10 Hz，统计最近 5 秒实际收到多少
+                win = min(5.0, now - t0 + 0.4)
+                rx5 = sum(1 for x in rx_times if now - x < win)
+                rate = 100.0 * rx5 / max(1.0, win * 10.0)
                 if tel and now - tel_t < 1.0:
                     st_name = {0: "DISARM", 1: "NET", 2: "ARMED"}.get(tel["state"], "?")
                     raw = f"Y{y:+5d} Rz{rz:+5d}" if raw_last else "Y  --- Rz  ---"
                     lock = "LOCK" if locked else "----"
-                    print(f"\r链路 {int((now-tel_t)*1000):3d}ms | {lock} {st_name:6s} | "
+                    print(f"\r链路 {int((now-tel_t)*1000):3d}ms 收包{rate:3.0f}% 车丢{tel['loss']:3d} | "
+                          f"{lock} {st_name:6s} | "
                           f"L {tel['rpm_l']:+5d} R {tel['rpm_r']:+5d} rpm | "
                           f"{tel['vbat']/1000:4.2f}V | "
                           f"油门 {thr:+4d} 转向 {st:+4d} | {raw}   ",
                           end="", flush=True)
                 else:
                     raw = f"Y{y:+5d} Rz{rz:+5d}" if raw_last else "Y  --- Rz  ---"
-                    print(f"\r链路 丢失 | 油门 {thr:+4d} 转向 {st:+4d} | {raw}   ",
+                    print(f"\r链路 丢失 收包{rate:3.0f}% | 油门 {thr:+4d} 转向 {st:+4d} | {raw}   ",
                           end="", flush=True)
 
             time.sleep(max(0.0, interval - (time.time() - now)))

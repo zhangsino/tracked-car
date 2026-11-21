@@ -311,6 +311,14 @@ static void chassis_stop(void)
 }
 
 /* ================= 任务 ================= */
+/* AP 模式下已连客户端的信号强度（没客户端返回 0）。户外测链路时看这个数。 */
+static int ap_client_rssi(void)
+{
+    wifi_sta_list_t list;
+    if (esp_wifi_ap_get_sta_list(&list) != ESP_OK || list.num <= 0) return 0;
+    return list.sta[0].rssi;
+}
+
 static void telemetry_task(void *arg)
 {
     (void)arg;
@@ -319,13 +327,15 @@ static void telemetry_task(void *arg)
 
         if (g_serial_ms != 0 && now_ms() - g_serial_ms < 1000) continue;
 
-        printf("[%s] L:%6.1f/%4d R:%6.1f/%4d rpm/duty | %.2fV | 目标%4d | pkt %lu\n",
+        printf("[%s] L:%6.1f/%4d R:%6.1f/%4d rpm/duty | %.2fV | 目标%4d | pkt %lu | ap %d dBm | 车丢 %lu\n",
                g_net_mode ? "NET" : "USB",
                g_rpm_l, g_left.duty,
                g_rpm_r, g_right.duty,
                g_vbat_mv / 1000.0,
                g_test_rpm,
-               (unsigned long)g_pkt_count);
+               (unsigned long)g_pkt_count,
+               ap_client_rssi(),
+               (unsigned long)g_loss_count);
     }
 }
 
@@ -884,7 +894,7 @@ void app_main(void)
         strlcpy((char *)ap_cfg.ap.ssid, WIFI_SSID, sizeof(ap_cfg.ap.ssid));
         ap_cfg.ap.ssid_len = strlen(WIFI_SSID);
         strlcpy((char *)ap_cfg.ap.password, WIFI_PASS, sizeof(ap_cfg.ap.password));
-        ap_cfg.ap.channel = 6;
+        ap_cfg.ap.channel = 11;   /* 家里 2.4G 挤在 ch6（HUAWEI-805 实测 -14 dBm），改 11 避开 */
         ap_cfg.ap.max_connection = 4;
         ap_cfg.ap.authmode = WIFI_AUTH_WPA2_PSK;
 
@@ -893,8 +903,8 @@ void app_main(void)
         ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_cfg));
         ESP_ERROR_CHECK(esp_wifi_start());
 
-        ESP_LOGI(TAG, "AP \"%s\"  pass \"%s\"  IP 192.168.4.1  UDP %d",
-                 WIFI_SSID, WIFI_PASS, UDP_PORT);
+        ESP_LOGI(TAG, "AP \"%s\"  pass \"%s\"  ch %d   IP 192.168.4.1  UDP %d",
+                 WIFI_SSID, WIFI_PASS, ap_cfg.ap.channel, UDP_PORT);
     }
 
 
