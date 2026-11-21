@@ -37,6 +37,9 @@
 
 #include "wifi_cred.h"
 
+#include "esp_now.h"
+#include "now_proto.h"
+
 static const char *TAG = "r3car";
 
 /* ================= 引脚定义 ================= */
@@ -116,6 +119,16 @@ static uint16_t          g_tx_seq = 0;
 static struct sockaddr_in g_peer;
 static volatile bool     g_have_peer = false;
 static volatile uint32_t g_serial_ms = 0;   /* 最近一次串口遥控帧的时刻 */
+
+/* ESP-NOW 统计（telemetry 的 HUD 也会读） */
+static const uint8_t s_bcast[ESP_NOW_ETH_ALEN] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+static uint8_t  s_tx_mac[ESP_NOW_ETH_ALEN];
+static volatile bool     s_tx_peer_ok;
+static volatile bool     s_tx_new;
+static volatile int8_t   s_rx_rssi;
+static volatile uint32_t s_now_seq, s_now_total, s_now_lost, s_now_cnt, s_now_hz;
+static volatile bool     s_arm_ready;   /* 解锁后油门必须先回中才允许发力 */
+
 
 /* ---- 电池电压检测 ---- */
 #define BAT_ADC_CH      ADC_CHANNEL_0    /* GPIO1 = ADC1_CH0 */
@@ -327,15 +340,16 @@ static void telemetry_task(void *arg)
 
         if (g_serial_ms != 0 && now_ms() - g_serial_ms < 1000) continue;
 
-        printf("[%s] L:%6.1f/%4d R:%6.1f/%4d rpm/duty | %.2fV | 目标%4d | pkt %lu | ap %d dBm | 车丢 %lu\n",
-               g_net_mode ? "NET" : "USB",
+        printf("[%s] L:%6.1f/%4d R:%6.1f/%4d rpm/duty | %.2fV | 目标%4d | 包 %lu @%luHz | %d dBm | 车丢 %lu\n",
+               g_net_mode ? "NOW" : "USB",
                g_rpm_l, g_left.duty,
                g_rpm_r, g_right.duty,
                g_vbat_mv / 1000.0,
                g_test_rpm,
-               (unsigned long)g_pkt_count,
-               ap_client_rssi(),
-               (unsigned long)g_loss_count);
+               (unsigned long)s_now_total,
+               (unsigned long)s_now_hz,
+               s_rx_rssi,
+               (unsigned long)s_now_lost);
     }
 }
 
@@ -646,15 +660,6 @@ static void build_telemetry(uint8_t *b)
     b[14] = crc & 0xFF; b[15] = crc >> 8;
 }
 
-static void wifi_evt(void *arg, esp_event_base_t base, int32_t id, void *data)
-{
-    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
-        wifi_event_sta_disconnected_t *e = (wifi_event_sta_disconnected_t *)data;
-        /* 15/204 握手超时（多半密码错）  201 找不到 AP  205 连接失败 */
-        ESP_LOGW(TAG, "STA 断开 reason=%d", e->reason);
-    }
-}
-
 static void net_task(void *arg)
 {
     (void)arg;
@@ -798,6 +803,168 @@ static void control_task(void *arg)
     }
 }
 
+/* ================= ESP-NOW 遥控（2026-11-21，取代 WiFi/UDP） =================
+ *
+ * 手持端（esp32_now/sender，RC2 插在它上面）每 20 ms 发一个 24 字节摇杆包，
+ * 这里收下来直接填进 g_rc —— 和原来 UDP 那条路填的是同一个结构，
+ * 所以电机、编码器、PI、断链保护、低电保护、斜坡全都不用动。
+ *
+ * 摇杆映射（沿用 ground/drive.py 的 Mode 2 习惯，别再自己发明）：
+ *   油门 = 右摇杆上下 Y   （推上 = 前进）
+ *   转向 = 左摇杆左右 Rz  （推右 = 右转）
+ * 上锁：左三态拨到【上位】= bit7 置位 = 车不动；中位、下位都可以动。
+ */
+#define NOW_CHANNEL   11
+#define NOW_CMD_MAX   1000          /* 摇杆满行程 660 -> 车指令 ±1000 */
+#define NOW_DEADZONE  35            /* 静止抖动约 ±8，留足余量 */
+#define LOCK_BIT      7
+
+
+static bool now_add_peer(const uint8_t *mac)
+{
+    esp_now_peer_info_t pi = {0};
+    memcpy(pi.peer_addr, mac, ESP_NOW_ETH_ALEN);
+    pi.channel = NOW_CHANNEL;
+    pi.ifidx = ESP_IF_WIFI_STA;
+    pi.encrypt = false;
+    esp_err_t e = esp_now_add_peer(&pi);
+    return e == ESP_OK || e == ESP_ERR_ESPNOW_EXIST;
+}
+
+static void now_recv_cb(const esp_now_recv_info_t *info, const uint8_t *data, int len)
+{
+    if (len < (int)sizeof(now_joystick_t)) {
+        return;
+    }
+    now_joystick_t p;
+    memcpy(&p, data, sizeof(p));
+    if (now_unpack(&p) != 0) {
+        return;
+    }
+
+    if (info && info->src_addr &&
+        (!s_tx_peer_ok || memcmp(s_tx_mac, info->src_addr, ESP_NOW_ETH_ALEN) != 0)) {
+        memcpy(s_tx_mac, info->src_addr, ESP_NOW_ETH_ALEN);
+        s_tx_new = true;
+    }
+    s_rx_rssi = (info && info->rx_ctrl) ? (int8_t)info->rx_ctrl->rssi : 0;
+
+    /* 序号：算收包率和丢包；倒退说明手持端重启过，计数从头来 */
+    if (s_now_seq != 0 && p.seq < s_now_seq) {
+        s_now_lost = 0;
+        s_now_total = 0;
+        s_now_seq = 0;
+    }
+    if (s_now_seq != 0 && p.seq > s_now_seq + 1) {
+        s_now_lost += p.seq - s_now_seq - 1;
+    }
+    s_now_seq = p.seq;
+    s_now_total++;
+    s_now_cnt++;
+    g_pkt_count++;
+
+    if (!(p.flags & NOW_FLAG_RC2_ON)) {
+        /* RC2 掉了：立刻当"没有指令"，别让车带着最后一帧跑 */
+        g_rc.throttle = 0;
+        g_rc.steer = 0;
+        g_rc.armed = false;
+        g_rc.last_ms = now_ms();
+        s_arm_ready = false;
+        return;
+    }
+
+    int thr = (int)((int32_t)p.y  * NOW_CMD_MAX / NOW_AXIS_FULL);
+    int st  = (int)((int32_t)p.rz * NOW_CMD_MAX / NOW_AXIS_FULL);
+    if (thr > -NOW_DEADZONE && thr < NOW_DEADZONE) thr = 0;
+    if (st  > -NOW_DEADZONE && st  < NOW_DEADZONE) st  = 0;
+
+    bool locked = ((p.buttons >> LOCK_BIT) & 1) != 0;
+    if (locked) {
+        thr = 0;
+        st = 0;
+        s_arm_ready = false;
+    } else if (!s_arm_ready && thr == 0) {
+        /* 防止"一解锁车就窜"：解锁后油门必须先在中位 */
+        s_arm_ready = true;
+    }
+
+    g_rc.throttle = clamp1000(thr);
+    g_rc.steer    = clamp1000(st);
+    g_rc.armed    = !locked && s_arm_ready;
+    g_rc.seq      = (uint16_t)p.seq;
+    g_rc.last_ms  = now_ms();
+}
+
+static void now_send_cb(const esp_now_send_info_t *tx_info, esp_now_send_status_t status)
+{
+    (void)tx_info;
+    (void)status;
+}
+
+/* 每 200 ms 把"我收到了多少 / 信号多强"回给手持端，屏上就能看到链路质量 */
+static void now_status_task(void *arg)
+{
+    TickType_t last = xTaskGetTickCount();
+    int tick = 0;
+
+    while (1) {
+        vTaskDelayUntil(&last, pdMS_TO_TICKS(200));
+
+        if (s_tx_new) {
+            s_tx_new = false;
+            if (s_tx_peer_ok) {
+                esp_now_del_peer(s_tx_mac);
+            }
+            s_tx_peer_ok = now_add_peer(s_tx_mac);
+            if (s_tx_peer_ok) {
+                ESP_LOGI(TAG, "手持端上线 %02x:%02x:%02x:%02x:%02x:%02x",
+                         s_tx_mac[0], s_tx_mac[1], s_tx_mac[2],
+                         s_tx_mac[3], s_tx_mac[4], s_tx_mac[5]);
+            }
+        }
+
+        if (++tick >= 5) {          /* 5 x 200 ms = 1 s，算一次收包率 */
+            tick = 0;
+            s_now_hz = s_now_cnt;
+            s_now_cnt = 0;
+        }
+
+        now_status_t st = {0};
+        st.rx_seq   = s_now_seq;
+        st.rx_total = s_now_total;
+        st.lost     = s_now_lost;
+        st.rssi     = s_rx_rssi;
+        st.rx_hz    = (uint8_t)(s_now_hz > 255 ? 255 : s_now_hz);
+        now_status_pack(&st);
+
+        const uint8_t *dst = s_tx_peer_ok ? s_tx_mac : s_bcast;
+        esp_now_send(dst, (const uint8_t *)&st, sizeof(st));
+    }
+}
+
+static void now_wifi_init(void)
+{
+    esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t cfg_now = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg_now));
+    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_start());
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));   /* 不省电，否则收包成串丢 */
+    ESP_ERROR_CHECK(esp_wifi_set_channel(NOW_CHANNEL, WIFI_SECOND_CHAN_NONE));
+
+    ESP_ERROR_CHECK(esp_now_init());
+    ESP_ERROR_CHECK(esp_now_register_recv_cb(now_recv_cb));
+    ESP_ERROR_CHECK(esp_now_register_send_cb(now_send_cb));
+    now_add_peer(s_bcast);
+
+    uint8_t mac[6];
+    esp_wifi_get_mac(WIFI_IF_STA, mac);
+    ESP_LOGI(TAG, "ESP-NOW 就绪：本车 MAC %02x:%02x:%02x:%02x:%02x:%02x  ch%d",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], NOW_CHANNEL);
+}
+
 /* ================= 入口 ================= */
 void app_main(void)
 {
@@ -844,71 +1011,11 @@ void app_main(void)
     xTaskCreatePinnedToCore(telemetry_task, "telemetry", 4096, NULL,  4, NULL, 0);
     xTaskCreatePinnedToCore(console_task,   "console",   4096, NULL,  3, NULL, 0);
 
-    wifi_init_config_t wcfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&wcfg));
+    /* --- ESP-NOW：原来的 WiFi AP / UDP 遥控整段撤掉（2026-11-21，见 git tag wifi-final） --- */
+    now_wifi_init();
+    xTaskCreatePinnedToCore(now_status_task, "now_st", 3072, NULL, 5, NULL, 0);
 
-    const char *sta_ssid = STA_SSID;
-    bool use_sta = (strlen(sta_ssid) > 0);
-
-    if (use_sta) {
-        /* ---- STA：连家里路由器 ---- */
-        esp_netif_create_default_wifi_sta();
-        wifi_config_t sta_cfg = {0};
-        strlcpy((char *)sta_cfg.sta.ssid, STA_SSID, sizeof(sta_cfg.sta.ssid));
-        strlcpy((char *)sta_cfg.sta.password, STA_PASS, sizeof(sta_cfg.sta.password));
-        /* 默认是 FAST_SCAN，扫到同名就停；有的路由器会漏，改成全信道按信号选 */
-        sta_cfg.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
-        sta_cfg.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
-        sta_cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
-        ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
-                                                          &wifi_evt, NULL, NULL));
-        ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-        ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_cfg));
-        ESP_ERROR_CHECK(esp_wifi_start());
-
-        ESP_LOGI(TAG, "STA 目标 len=%d [%s]", (int)strlen(STA_SSID), STA_SSID);
-
-        /* 最多等 8 秒，连不上就退回 AP */
-        bool ok = false;
-        for (int i = 0; i < 16; i++) {
-            vTaskDelay(pdMS_TO_TICKS(500));
-            wifi_ap_record_t apinfo;
-            if (esp_wifi_sta_get_ap_info(&apinfo) == ESP_OK) { ok = true; break; }
-        }
-
-        if (ok) {
-            esp_netif_ip_info_t ip;
-            esp_netif_t *nif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
-            if (nif && esp_netif_get_ip_info(nif, &ip) == ESP_OK) {
-                ESP_LOGW(TAG, "STA 已连上，本车 IP " IPSTR, IP2STR(&ip.ip));
-                ESP_LOGW(TAG, "Mac 上运行 ground/drive.py --host 自动发现即可");
-            }
-            ESP_LOGI(TAG, "UDP 监听 %d", UDP_PORT);
-        } else {
-            ESP_LOGW(TAG, "STA 连接超时，改用 AP 模式");
-            use_sta = false;
-            esp_wifi_stop();
-        }
-    }
-
-    if (!use_sta) {
-        esp_netif_create_default_wifi_ap();
-        wifi_config_t ap_cfg = {0};
-        strlcpy((char *)ap_cfg.ap.ssid, WIFI_SSID, sizeof(ap_cfg.ap.ssid));
-        ap_cfg.ap.ssid_len = strlen(WIFI_SSID);
-        strlcpy((char *)ap_cfg.ap.password, WIFI_PASS, sizeof(ap_cfg.ap.password));
-        ap_cfg.ap.channel = 11;   /* 家里 2.4G 挤在 ch6（HUAWEI-805 实测 -14 dBm），改 11 避开 */
-        ap_cfg.ap.max_connection = 4;
-        ap_cfg.ap.authmode = WIFI_AUTH_WPA2_PSK;
-
-        /* APSTA 而不是纯 AP：纯 AP 模式下驱动拒绝扫描，诊断时看不见周边 */
-        ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
-        ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_cfg));
-        ESP_ERROR_CHECK(esp_wifi_start());
-
-        ESP_LOGI(TAG, "AP \"%s\"  pass \"%s\"  ch %d   IP 192.168.4.1  UDP %d",
-                 WIFI_SSID, WIFI_PASS, ap_cfg.ap.channel, UDP_PORT);
-    }
+    ESP_LOGI(TAG, "ESP-NOW 模式：手持端直接开车，不连路由器、不经过 Mac");
 
 
     ESP_LOGI(TAG, "ready. outputs are 0 until a command arrives.");
