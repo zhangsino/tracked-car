@@ -60,7 +60,8 @@ def parse_telemetry(pkt: bytes):
     if (pkt[14] | (pkt[15] << 8)) != crc16_ccitt(pkt[:14]):
         return None
     return dict(state=pkt[3],
-                seq=pkt[4] | (pkt[5] << 8),
+                rssi=struct.unpack_from("<b", pkt, 4)[0],   # 车侧看到的本机信号，0=无客户端
+                seq=pkt[5],
                 vbat=pkt[6] | (pkt[7] << 8),
                 rpm_l=struct.unpack_from("<h", pkt, 8)[0],
                 rpm_r=struct.unpack_from("<h", pkt, 10)[0],
@@ -339,7 +340,8 @@ def main():
                     st_name = {0: "DISARM", 1: "NET", 2: "ARMED"}.get(tel["state"], "?")
                     raw = f"Y{y:+5d} Rz{rz:+5d}" if raw_last else "Y  --- Rz  ---"
                     lock = "LOCK" if locked else "----"
-                    print(f"\r链路 {int((now-tel_t)*1000):3d}ms 收包{rate:3.0f}% 车丢{tel['loss']:3d} | "
+                    print(f"\r链路 {int((now-tel_t)*1000):3d}ms 收包{rate:3.0f}% 车丢{tel['loss']:3d} "
+                          f"信号{tel['rssi']:4d}dBm | "
                           f"{lock} {st_name:6s} | "
                           f"L {tel['rpm_l']:+5d} R {tel['rpm_r']:+5d} rpm | "
                           f"{tel['vbat']/1000:4.2f}V | "

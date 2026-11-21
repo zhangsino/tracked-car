@@ -7,7 +7,10 @@
   连车的热点时：
     python3 -u ground/linktest.py --host 192.168.4.1 --csv link.csv
   有线（只验工具本身）：
-    python3 -u ground/linktest.py --serial /dev/cu.usbmodem2101 --no-rssi
+    python3 -u ground/linktest.py --serial /dev/cu.usbmodem2101 --seconds 5
+
+信号强度来自车端（上行包里的 RSSI），所以**不需要 macOS 扫描**——扫描会打断射频，
+测出来的丢包其实是自己在打自己。想看 Mac 侧的数再加 --mac-rssi，但那一项的代价就是丢包。
 
 屏幕每一行：时间 | 收包 Hz | 车丢增量 | Mac 侧 RSSI
 收包 Hz 是最近 2 秒的统计。标称 10 Hz，**有线实测 9.3 Hz 是正常上限**（固件 100 ms 定时的抖动），
@@ -54,7 +57,8 @@ def main():
     ap.add_argument("--host", default=None, help="车 IP，如 192.168.4.1")
     ap.add_argument("--serial", metavar="PORT", help="有线串口")
     ap.add_argument("--csv", metavar="PATH", help="记录到 CSV")
-    ap.add_argument("--no-rssi", action="store_true", help="不读 Mac 侧 RSSI（有线时用）")
+    ap.add_argument("--mac-rssi", action="store_true",
+                    help="额外读 Mac 侧 RSSI。注意：它会触发 macOS 扫描，扫描期间必然丢包，默认关")
     ap.add_argument("--seconds", type=float, default=0, help="跑多少秒后退出，0=一直跑")
     args = ap.parse_args()
 
@@ -62,7 +66,7 @@ def main():
     print(f"传输：{link.name}")
 
     rt = None
-    if not args.no_rssi and rssi_mod is not None:
+    if args.mac_rssi and rssi_mod is not None:
         rt = RssiThread()
         rt.start()
 
@@ -71,13 +75,14 @@ def main():
         fh = open(args.csv, "a", newline="")
         wr = csv.writer(fh)
         if fh.tell() == 0:
-            wr.writerow(["time", "距离", "收包hz", "车丢增量", "ssid", "rssi", "snr", "ch"])
+            wr.writerow(["time", "距离", "收包hz", "车丢增量", "车侧rssi", "mac_rssi", "snr", "ch"])
 
     seq = 0
     t0 = time.time()
     stamps = []            # 最近 2 秒收到的遥测时刻
     last_loss = None
     loss_delta = 0
+    car_rssi = 0
     last_print = 0.0
     print("发零油门保活包中（车不会动）。Ctrl-C 退出。\n")
 
@@ -93,6 +98,7 @@ def main():
                 if last_loss is not None:
                     loss_delta = (t["loss"] - last_loss) & 0xFFFF
                 last_loss = t["loss"]
+                car_rssi = t.get("rssi", 0)
 
             while stamps and now - stamps[0] > 3.0:
                 stamps.pop(0)
@@ -101,15 +107,18 @@ def main():
                 last_print = now
                 win = min(3.0, max(0.5, now - t0))
                 hz = len(stamps) / win
-                ssid = r = snr = ch = ""
+                mac = ""
+                mr = ""
+                ssid = snr = ch = ""
                 if rt and rt.value:
-                    ssid, r, snr, ch = rt.value
+                    ssid, mr, snr, ch = rt.value
+                    mac = f"  mac {mr} dBm"
                 tag = "断链" if hz < 0.5 else ("丢包" if hz < 5.0 else "")
                 print(f"{time.strftime('%H:%M:%S')}  收包 {hz:4.1f} Hz  车丢 +{loss_delta:2d}  "
-                      f"RSSI {str(r):>4s} dBm  SNR {str(snr):>3s}  ch{str(ch):>3s} {ssid} {tag}")
+                      f"车侧 {car_rssi:4d} dBm{mac}  {tag}")
                 if wr:
                     wr.writerow([time.strftime("%H:%M:%S"), "", f"{hz:.1f}", loss_delta,
-                                 ssid, r, snr, ch])
+                                 car_rssi, mr if rt and rt.value else "", snr, ch])
                     fh.flush()
             time.sleep(0.02)
     except KeyboardInterrupt:

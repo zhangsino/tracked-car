@@ -620,14 +620,17 @@ static void handle_packet(const uint8_t *p, int n, int src)
     if (src == 1) g_serial_ms = g_rc.last_ms;
 }
 
-/* 上行 16 字节：'R','T',ver,state,seq(2),vbat(2),rpmL(2),rpmR(2),loss(2),crc(2) */
+/* 上行 16 字节：'R','T',ver,state,rssi(1),seq(1),vbat(2),rpmL(2),rpmR(2),loss(2),crc(2)
+   rssi = AP 侧看到的客户端信号强度，int8，0 表示没有客户端。放这里是为了让地面站不扫描
+   也能看到信号——macOS 每扫一次信道就丢一串包，测距时等于自己打自己。 */
 static void build_telemetry(uint8_t *b)
 {
     b[0] = 0xA5; b[1] = 0x5B; b[2] = 1;
     b[3] = g_net_mode ? ((now_ms() - g_rc.last_ms < CMD_TIMEOUT_MS) ? 2 : 1) : 0;
 
-    uint16_t seq = g_tx_seq++;
-    b[4] = seq & 0xFF; b[5] = seq >> 8;
+    int rssi = ap_client_rssi();
+    b[4] = (uint8_t)(int8_t)(rssi < -127 ? -127 : rssi);
+    b[5] = (uint8_t)(g_tx_seq++ & 0xFF);
 
     uint16_t vbat = g_vbat_mv;
     b[6] = vbat & 0xFF; b[7] = vbat >> 8;
