@@ -863,7 +863,8 @@ static void now_recv_cb(const esp_now_recv_info_t *info, const uint8_t *data, in
     s_now_cnt++;
     g_pkt_count++;
 
-    if (!(p.flags & NOW_FLAG_RC2_ON)) {
+    /* 摇杆包（RC2）和倾斜包都算有效数据源；两个都没有就说明手持端没在管车 */
+    if (!(p.flags & (NOW_FLAG_RC2_ON | NOW_FLAG_TILT))) {
         /* RC2 掉了：立刻当"没有指令"，别让车带着最后一帧跑 */
         g_rc.throttle = 0;
         g_rc.steer = 0;
@@ -878,8 +879,10 @@ static void now_recv_cb(const esp_now_recv_info_t *info, const uint8_t *data, in
     if (thr > -NOW_DEADZONE && thr < NOW_DEADZONE) thr = 0;
     if (st  > -NOW_DEADZONE && st  < NOW_DEADZONE) st  = 0;
 
-    bool locked = ((p.buttons >> LOCK_BIT) & 1) != 0;
-    if (locked) {
+    /* 解不解锁由手持端决定（RC2 看左三态，倾斜模式看那个按钮），车只执行。
+       协议 v3 起用 NOW_FLAG_ARMED，不再自己数 bit7。 */
+    bool armed_tx = (p.flags & NOW_FLAG_ARMED) != 0;
+    if (!armed_tx) {
         thr = 0;
         st = 0;
         s_arm_ready = false;
@@ -890,7 +893,7 @@ static void now_recv_cb(const esp_now_recv_info_t *info, const uint8_t *data, in
 
     g_rc.throttle = clamp1000(thr);
     g_rc.steer    = clamp1000(st);
-    g_rc.armed    = !locked && s_arm_ready;
+    g_rc.armed    = armed_tx && s_arm_ready;
     g_rc.seq      = (uint16_t)p.seq;
     g_rc.last_ms  = now_ms();
 }
